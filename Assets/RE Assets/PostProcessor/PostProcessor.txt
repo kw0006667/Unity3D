@@ -1,0 +1,178 @@
+#include "UnityCG.cginc"
+
+// Had to change the name of this or I got an error in Islands exporting, but not in my project.  Weird stuff.
+
+sampler2D _Blur1;
+sampler2D _Blur2;
+sampler2D _Blur3;
+sampler2D _Blur4;
+sampler2D _Blur5;
+sampler2D _Blur6;
+sampler2D _Blur7;
+sampler2D _Blur8;
+float _BlurCombineFinalIntensitySubtract;
+float _BlurCombineFinalIntensityMult;
+float _BlurCombineFinalIntensityPow;
+float _BlurCombineFinalIntensityMidrange;
+float4 _BlurTint;
+float _FocusOverallIntensity;
+float _FocusIntensityPow;
+float _FocusImageStepDecay;
+float _FocusDistance;
+float _FocusDistanceBeforeBlur;
+
+struct v2f {
+	float4 pos : POSITION;
+	float4 uv: TEXCOORD0;
+};
+
+struct a2v
+    {
+       float4 vertex : POSITION;
+       float4 texcoord : TEXCOORD0;
+    };
+        
+v2f vert (a2v v)
+{
+	v2f o;
+	o.pos = mul (UNITY_MATRIX_MVP, v.vertex);
+	o.uv.zw=0;
+	o.uv.xy = TRANSFORM_UV(0).xy;
+
+	return o;
+}
+
+	
+
+
+half4 applyBloomColoring(half4 bloomColor)
+	{
+	bloomColor.w=pow(bloomColor.w/_BlurCombineFinalIntensityMidrange,_BlurCombineFinalIntensityPow)*_BlurCombineFinalIntensityMidrange;
+	bloomColor.w=clamp(bloomColor.w-_BlurCombineFinalIntensitySubtract,0,1000);
+	bloomColor.xyz=_BlurTint.xyz*bloomColor.xyz*bloomColor.w*_BlurCombineFinalIntensityMult;
+	return bloomColor;
+	}
+
+half gMult;
+half gMultStartingPoint;
+
+float intensity;
+half4 getBlurTex(v2f i,sampler2D tex,half4 color,float decay)
+	{
+	intensity+=decay;
+	half4 c=tex2D(tex, i.uv.xy);
+	gMult=((gMultStartingPoint-saturate(abs(1.0-intensity)*.25f)))*1;
+	if (intensity>0)
+		gMult+=intensity;
+//	gMult=1;
+	
+	color.xyz+=(c.xyz*(gMult));
+	color.w+=gMult;  // Storing this so we can use it to determine the length of the resulting color.
+	return color;
+	}
+
+
+/*
+Note, this could be removed and put into two passes, one doing the pixel intensity, and another doing the bloom, to simplify the math.  Alternatively,
+the blend values for the maps could be rendered to an image, which would seperate some of the math, but would be nice to have MRT support so that two
+maps could be blended at the same time, letting us use 6 images for the composite.  Either of these changes would allow us to have a solution that's 
+likely pretty fast (second option likely best overall, since that image(s) could also be rended to for advanced bluring techniques), and work on SM2 while
+looking good, but I don't feel like doing it ATM.
+
+Should be revisited when MRT is available.
+*/
+half4 getPixelBasedOnBlurLevel( v2f i ,float pixelBlur)
+	{
+	half4 c,blurColor;
+
+	float maxIntensity,originalPixelIntensity;
+//	pixelBlur=0;
+	intensity=-(pixelBlur*_FocusImageStepDecay)+1;  // This represents how much the first image matters, and variation from 1 means it matters less.
+	
+	gMultStartingPoint=1.0;
+	originalPixelIntensity=intensity;
+	c=0;
+	c=getBlurTex(i,_Blur1, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur2, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur3, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur4, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur5, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur6, c,_FocusImageStepDecay);
+	gMultStartingPoint=1.1;  // This ensures that something is added to the blur areas that go beyond the range, and it doesn't go black.
+	c=getBlurTex(i, _Blur7, c,_FocusImageStepDecay);
+	
+	maxIntensity=c.w;  // This is the total amount of intensity that could have been added to the color.
+	c.xyz/=c.w;  // w component is the max intensity of c, so this should give us a pixel normalized to maximum color.
+	
+//	c=tex2D(_Blur1, i.uv.xy);c.w=1; maxIntensity=1;  // for testing.
+	
+	// We're going to normalize our color and intensity, so that our pow functions work in a way that doesn't make the eyes bleed.
+	blurColor.w=dot(half3(0.222, 0.707, 0.071), c.xyz);
+	blurColor.xyz=c.xyz/blurColor.w;
+	
+	blurColor=applyBloomColoring(blurColor);
+	
+//	originalPixelIntensity=0;
+	c.w=saturate(originalPixelIntensity);
+	c.xyz*=1.0-c.w;
+	c.xyz+=blurColor.xyz;
+
+	//	for testing
+//		intensity=0;
+//		c=0;
+//		c=getBlurTex(i,_Blur1, c,_FocusImageStepDecay);
+//		c=tex2D(_Blur1, i.uv.xy);
+	
+	return c;
+	}
+
+// Just a lame, stripped down version of the normal one that should give us a decent fallback to SM2.
+half4 getPixelBasedOnBlurLevelSM2( v2f i ,float pixelBlur)
+	{
+	half4 c,blurColor;
+
+	float intensity,maxIntensity,originalPixelIntensity;
+//	pixelBlur=0;
+	intensity=-(pixelBlur*_FocusImageStepDecay)+2;  // This represents how much the first image matters, and variation from 1 means it matters less.
+	
+	gMultStartingPoint=1.0;
+	originalPixelIntensity=intensity;
+	c=0;
+	c=getBlurTex(i,_Blur2, c,_FocusImageStepDecay);
+	c=getBlurTex(i, _Blur4, c,_FocusImageStepDecay);
+	c=gMultStartingPoint=1.1;  // This ensures that something is added to the blur areas that go beyond the range, and it doesn't go black.
+	c=getBlurTex(i, _Blur6, c,_FocusImageStepDecay);
+//	c=getBlurTex(i, _Blur4, c,_FocusImageStepDecay);
+//	c=getBlurTex(i, _Blur5, c,_FocusImageStepDecay);
+//	c=getBlurTex(i, _Blur6, c,_FocusImageStepDecay);
+//	c=getBlurTex(i, _Blur7, c,_FocusImageStepDecay);
+	
+	maxIntensity=c.w;  // This is the total amount of intensity that could have been added to the color.
+	c.xyz/=c.w;  // w component is the max intensity of c, so this should give us a pixel normalized to maximum color.
+	
+//	c=tex2D(_Blur1, i.uv.xy);c.w=1; maxIntensity=1;  // for testing.
+	
+	// We're going to normalize our color and intensity, so that our pow functions work in a way that doesn't make the eyes bleed.
+	blurColor.w=dot(half3(0.222, 0.707, 0.071), c.xyz);
+	blurColor.xyz=c.xyz/blurColor.w;
+	
+	blurColor=applyBloomColoring(blurColor);
+	
+//	originalPixelIntensity=0;
+	c.w=saturate(originalPixelIntensity);
+	c.xyz*=1.0-c.w;
+	c.xyz+=blurColor.xyz;
+	
+	return c;
+	}
+
+
+float calculateBlurAmount(float blurAmount,float depth)
+	{
+	blurAmount=pow(depth-_FocusDistance,_FocusIntensityPow);  // This serves as a pow, and an absolute value method.
+	blurAmount-=_FocusDistanceBeforeBlur;  // So that we have a bit of a gap, if you want to have a range that remains well defined, then have this value cover that range.
+	blurAmount=clamp(blurAmount*_FocusOverallIntensity,0,6);
+	return blurAmount;
+	}
+
+
